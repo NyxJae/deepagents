@@ -96,7 +96,8 @@ def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) 
 
     Ensures paths are safe to use by preventing directory traversal attacks
     and enforcing consistent formatting. All paths are normalized to use
-    forward slashes and start with a leading slash.
+    forward slashes. Windows absolute paths are handled specially to avoid
+    incorrect prefix addition.
 
     Args:
         path: The path to validate and normalize.
@@ -104,7 +105,9 @@ def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) 
             the normalized path must start with one of these prefixes.
 
     Returns:
-        Normalized canonical path starting with `/` and using forward slashes.
+        Normalized canonical path using forward slashes. Windows absolute paths
+        preserve their drive letter format (e.g., "F:/path"), while Unix paths
+        and relative paths start with "/" (e.g., "/path").
 
     Raises:
         ValueError: If path contains traversal sequences (`..` or `~`) or does
@@ -117,17 +120,28 @@ def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) 
         validate_path("../etc/passwd")  # Raises ValueError
         validate_path("/data/file.txt", allowed_prefixes=["/data/"])  # OK
         validate_path("/etc/file.txt", allowed_prefixes=["/data/"])  # Raises ValueError
+        validate_path("F:\\Projects\\test")  # Returns: "F:/Projects/test" (Windows)
+        validate_path("F:/Projects/test")  # Returns: "F:/Projects/test" (Windows)
         ```
     """
-    if ".." in path or path.startswith("~"):
+    # 改进的路径标准化
+    normalized = os.path.normpath(path)
+    
+    # 在标准化后检查路径遍历攻击
+    if ".." in normalized or normalized.startswith("~"):
         msg = f"Path traversal not allowed: {path}"
         raise ValueError(msg)
-
-    normalized = os.path.normpath(path)
-    normalized = normalized.replace("\\", "/")
-
-    if not normalized.startswith("/"):
-        normalized = f"/{normalized}"
+    
+    # Windows特殊处理：检测驱动器字母
+    if os.name == 'nt' and len(normalized) >= 2 and normalized[1] == ':':
+        # Windows绝对路径，保持原样，不要添加前缀
+        # 只转换分隔符以保持内部一致性
+        normalized = normalized.replace("\\", "/")
+    else:
+        # Unix路径或相对路径
+        normalized = normalized.replace("\\", "/")
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
 
     if allowed_prefixes is not None and not any(normalized.startswith(prefix) for prefix in allowed_prefixes):
         msg = f"Path must start with one of {allowed_prefixes}: {path}"
