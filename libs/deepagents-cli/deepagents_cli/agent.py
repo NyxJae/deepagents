@@ -1,6 +1,7 @@
 """Agent management and creation for the CLI."""
 
 import os
+import platform
 import shutil
 from pathlib import Path
 
@@ -311,7 +312,9 @@ def create_agent_with_config(
             AgentMemoryMiddleware(settings=settings, assistant_id=assistant_id),
             SkillsMiddleware(skills_dir=skills_dir, assistant_id=assistant_id),
             ResumableShellToolMiddleware(
-                workspace_root=os.getcwd(), execution_policy=HostExecutionPolicy()
+                workspace_root=os.getcwd(),
+                execution_policy=HostExecutionPolicy(),
+                shell_command=_get_shell_command()
             ),
         ]
     else:
@@ -387,5 +390,36 @@ def create_agent_with_config(
     ).with_config(config)
 
     agent.checkpointer = InMemorySaver()
-
+    
     return agent, composite_backend
+
+
+def _get_shell_command() -> str:
+    """获取适合当前操作系统的 shell 命令路径。
+    
+    Returns:
+        适合当前系统的 shell 可执行文件路径
+    """
+    system = platform.system().lower()
+    
+    if system == "windows":
+        # Windows 系统上尝试使用 Git Bash
+        git_bash_paths = [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\Git\bin\bash.exe",
+        ]
+        
+        for bash_path in git_bash_paths:
+            if os.path.exists(bash_path):
+                return bash_path
+        
+        # 如果找不到 Git Bash，尝试使用系统 PATH 中的 bash
+        if shutil.which("bash"):
+            return "bash"
+        
+        # 最后回退到 cmd.exe
+        return "cmd.exe"
+    else:
+        # Linux/macOS 系统使用默认的 bash
+        return "/bin/bash"

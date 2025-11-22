@@ -3,8 +3,13 @@
 import asyncio
 import json
 import sys
-import termios
-import tty
+
+try:
+    import termios
+    import tty
+    HAS_TERMIOS = True
+except ImportError:
+    HAS_TERMIOS = False
 
 from langchain.agents.middleware.human_in_the_loop import (
     ActionRequest,
@@ -36,6 +41,125 @@ from deepagents_cli.ui import (
 _HITL_REQUEST_ADAPTER = TypeAdapter(HITLRequest)
 
 
+def _windows_approval_input() -> int:
+    """Handle approval input on Windows systems using simple text input."""
+    console.print("  ☐ (A)pprove  (default)")
+    console.print("  ☐ (R)eject")
+    console.print("  ☐ (Auto)-accept all going forward")
+
+    while True:
+        try:
+            choice = input(
+                "\nChoice (A/R/Auto, default=Approve): ").strip().lower()
+        except EOFError:
+            return 1  # Reject on EOF
+
+        if not choice or choice in {"a", "approve", "y", "yes"}:
+            return 0
+        elif choice in {"r", "reject", "n", "no"}:
+            return 1
+        elif choice in {"auto", "auto-accept"}:
+            return 2
+        else:
+            console.print(
+                "[red]Invalid choice. Please enter A, R, or Auto.[/red]")
+
+
+def _unix_approval_input(options: list[str]) -> int:
+    """Handle approval input on Unix systems using termios/tty for arrow keys."""
+    selected = 0  # Start with approve selected
+    try:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        try:
+            tty.setraw(fd)
+            # Hide cursor during menu interaction
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+
+            # Initial render flag
+            first_render = True
+
+            while True:
+                if not first_render:
+                    # Move cursor back to start of menu (up 3 lines, then to start of line)
+                    sys.stdout.write("\033[3A\r")
+
+                first_render = False
+
+                # Display options vertically with ANSI color codes
+                for i, option in enumerate(options):
+                    # Clear line from cursor to end
+                    sys.stdout.write("\r\033[K")
+
+                    if i == selected:
+                        if option == "approve":
+                            # Green bold with filled checkbox
+                            sys.stdout.write("\033[1;32m☑ Approve\033[0m\n")
+                        elif option == "reject":
+                            # Red bold with filled checkbox
+                            sys.stdout.write("\033[1;31m☑ Reject\033[0m\n")
+                        else:
+                            # Blue bold with filled checkbox for auto-accept
+                            sys.stdout.write(
+                                "\033[1;34m☑ Auto-accept all going forward\033[0m\n")
+                    elif option == "approve":
+                        # Dim with empty checkbox
+                        sys.stdout.write("\033[2m☐ Approve\033[0m\n")
+                    elif option == "reject":
+                        # Dim with empty checkbox
+                        sys.stdout.write("\033[2m☐ Reject\033[0m\n")
+                    else:
+                        # Dim with empty checkbox
+                        sys.stdout.write(
+                            "\033[2m☐ Auto-accept all going forward\033[0m\n")
+
+                sys.stdout.flush()
+
+                # Read key
+                char = sys.stdin.read(1)
+
+                if char == "\x1b":  # ESC sequence (arrow keys)
+                    next1 = sys.stdin.read(1)
+                    next2 = sys.stdin.read(1)
+                    if next1 == "[":
+                        if next2 == "B":  # Down arrow
+                            selected = (selected + 1) % len(options)
+                        elif next2 == "A":  # Up arrow
+                            selected = (selected - 1) % len(options)
+                elif char in {"\r", "\n"}:  # Enter
+                    # Move to start of line and add newline
+                    sys.stdout.write("\r\n")
+                    break
+                elif char == "\x03":  # Ctrl+C
+                    # Move to start of line and add newline
+                    sys.stdout.write("\r\n")
+                    raise KeyboardInterrupt
+                elif char.lower() == "a":
+                    selected = 0
+                    # Move to start of line and add newline
+                    sys.stdout.write("\r\n")
+                    break
+                elif char.lower() == "r":
+                    selected = 1
+                    # Move to start of line and add newline
+                    sys.stdout.write("\r\n")
+                    break
+
+        finally:
+            # Show cursor again
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    except (termios.error, AttributeError):
+        # Fallback if termios fails even if imported
+        return _windows_approval_input()
+
+    return selected
+
+
 def prompt_for_tool_approval(
     action_request: ActionRequest,
     assistant_id: str | None,
@@ -49,7 +173,8 @@ def prompt_for_tool_approval(
     description = action_request.get("description", "No description available")
     name = action_request["name"]
     args = action_request["args"]
-    preview = build_approval_preview(name, args, assistant_id) if name else None
+    preview = build_approval_preview(
+        name, args, assistant_id) if name else None
 
     body_lines = []
     if preview:
@@ -75,98 +200,11 @@ def prompt_for_tool_approval(
         render_diff_block(preview.diff, preview.diff_title or preview.title)
 
     options = ["approve", "reject", "auto-accept all going forward"]
-    selected = 0  # Start with approve selected
 
-    try:
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-
-        try:
-            tty.setraw(fd)
-            # Hide cursor during menu interaction
-            sys.stdout.write("\033[?25l")
-            sys.stdout.flush()
-
-            # Initial render flag
-            first_render = True
-
-            while True:
-                if not first_render:
-                    # Move cursor back to start of menu (up 3 lines, then to start of line)
-                    sys.stdout.write("\033[3A\r")
-
-                first_render = False
-
-                # Display options vertically with ANSI color codes
-                for i, option in enumerate(options):
-                    sys.stdout.write("\r\033[K")  # Clear line from cursor to end
-
-                    if i == selected:
-                        if option == "approve":
-                            # Green bold with filled checkbox
-                            sys.stdout.write("\033[1;32m☑ Approve\033[0m\n")
-                        elif option == "reject":
-                            # Red bold with filled checkbox
-                            sys.stdout.write("\033[1;31m☑ Reject\033[0m\n")
-                        else:
-                            # Blue bold with filled checkbox for auto-accept
-                            sys.stdout.write("\033[1;34m☑ Auto-accept all going forward\033[0m\n")
-                    elif option == "approve":
-                        # Dim with empty checkbox
-                        sys.stdout.write("\033[2m☐ Approve\033[0m\n")
-                    elif option == "reject":
-                        # Dim with empty checkbox
-                        sys.stdout.write("\033[2m☐ Reject\033[0m\n")
-                    else:
-                        # Dim with empty checkbox
-                        sys.stdout.write("\033[2m☐ Auto-accept all going forward\033[0m\n")
-
-                sys.stdout.flush()
-
-                # Read key
-                char = sys.stdin.read(1)
-
-                if char == "\x1b":  # ESC sequence (arrow keys)
-                    next1 = sys.stdin.read(1)
-                    next2 = sys.stdin.read(1)
-                    if next1 == "[":
-                        if next2 == "B":  # Down arrow
-                            selected = (selected + 1) % len(options)
-                        elif next2 == "A":  # Up arrow
-                            selected = (selected - 1) % len(options)
-                elif char in {"\r", "\n"}:  # Enter
-                    sys.stdout.write("\r\n")  # Move to start of line and add newline
-                    break
-                elif char == "\x03":  # Ctrl+C
-                    sys.stdout.write("\r\n")  # Move to start of line and add newline
-                    raise KeyboardInterrupt
-                elif char.lower() == "a":
-                    selected = 0
-                    sys.stdout.write("\r\n")  # Move to start of line and add newline
-                    break
-                elif char.lower() == "r":
-                    selected = 1
-                    sys.stdout.write("\r\n")  # Move to start of line and add newline
-                    break
-
-        finally:
-            # Show cursor again
-            sys.stdout.write("\033[?25h")
-            sys.stdout.flush()
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-    except (termios.error, AttributeError):
-        # Fallback for non-Unix systems
-        console.print("  ☐ (A)pprove  (default)")
-        console.print("  ☐ (R)eject")
-        console.print("  ☐ (Auto)-accept all going forward")
-        choice = input("\nChoice (A/R/Auto, default=Approve): ").strip().lower()
-        if choice in {"r", "reject"}:
-            selected = 1
-        elif choice in {"auto", "auto-accept"}:
-            selected = 2
-        else:
-            selected = 0
+    if HAS_TERMIOS:
+        selected = _unix_approval_input(options)
+    else:
+        selected = _windows_approval_input()
 
     # Return decision based on selection
     if selected == 0:
@@ -202,7 +240,8 @@ async def execute_task(
                     f"\n### {file_path.name}\nPath: `{file_path}`\n```\n{content}\n```"
                 )
             except Exception as e:
-                context_parts.append(f"\n### {file_path.name}\n[Error reading file: {e}]")
+                context_parts.append(
+                    f"\n### {file_path.name}\n[Error reading file: {e}]")
 
         final_input = "\n".join(context_parts)
     else:
@@ -218,7 +257,8 @@ async def execute_task(
     captured_output_tokens = 0
     current_todos = None  # Track current todo list state
 
-    status = console.status(f"[bold {COLORS['thinking']}]Agent is thinking...", spinner="dots")
+    status = console.status(
+        f"[bold {COLORS['thinking']}]Agent is thinking...", spinner="dots")
     status.start()
     spinner_active = True
 
@@ -274,7 +314,8 @@ async def execute_task(
 
             async for chunk in agent.astream(
                 stream_input,
-                stream_mode=["messages", "updates"],  # Dual-mode for HITL support
+                # Dual-mode for HITL support
+                stream_mode=["messages", "updates"],
                 subgraphs=True,
                 config=config,
                 durability="exit",
@@ -342,7 +383,8 @@ async def execute_task(
                                 status.stop()
                                 spinner_active = False
                             if not has_responded:
-                                console.print("●", style=COLORS["agent"], markup=False, end=" ")
+                                console.print(
+                                    "●", style=COLORS["agent"], markup=False, end=" ")
                                 has_responded = True
                             markdown = Markdown(content)
                             console.print(markdown, style=COLORS["agent"])
@@ -354,12 +396,14 @@ async def execute_task(
                         # Exception: show shell command errors to help with debugging
                         tool_name = getattr(message, "name", "")
                         tool_status = getattr(message, "status", "success")
-                        tool_content = format_tool_message_content(message.content)
+                        tool_content = format_tool_message_content(
+                            message.content)
                         record = file_op_tracker.complete_with_message(message)
 
                         # Reset spinner message after tool completes
                         if spinner_active:
-                            status.update(f"[bold {COLORS['thinking']}]Agent is thinking...")
+                            status.update(
+                                f"[bold {COLORS['thinking']}]Agent is thinking...")
 
                         if tool_name == "shell" and tool_status != "success":
                             flush_text_buffer(final=True)
@@ -368,7 +412,8 @@ async def execute_task(
                                     status.stop()
                                     spinner_active = False
                                 console.print()
-                                console.print(tool_content, style="red", markup=False)
+                                console.print(
+                                    tool_content, style="red", markup=False)
                                 console.print()
                         elif tool_content and isinstance(tool_content, str):
                             stripped = tool_content.lstrip()
@@ -378,7 +423,8 @@ async def execute_task(
                                     status.stop()
                                     spinner_active = False
                                 console.print()
-                                console.print(tool_content, style="red", markup=False)
+                                console.print(
+                                    tool_content, style="red", markup=False)
                                 console.print()
 
                         if record:
@@ -409,8 +455,10 @@ async def execute_task(
                             input_toks = usage.get("input_tokens", 0)
                             output_toks = usage.get("output_tokens", 0)
                             if input_toks or output_toks:
-                                captured_input_tokens = max(captured_input_tokens, input_toks)
-                                captured_output_tokens = max(captured_output_tokens, output_toks)
+                                captured_input_tokens = max(
+                                    captured_input_tokens, input_toks)
+                                captured_output_tokens = max(
+                                    captured_output_tokens, output_toks)
 
                     # Process content blocks (this is the key fix!)
                     for block in message.content_blocks:
@@ -450,7 +498,8 @@ async def execute_task(
 
                             buffer = tool_call_buffers.setdefault(
                                 buffer_key,
-                                {"name": None, "id": None, "args": None, "args_parts": []},
+                                {"name": None, "id": None,
+                                    "args": None, "args_parts": []},
                             )
 
                             if chunk_name:
@@ -463,7 +512,8 @@ async def execute_task(
                                 buffer["args_parts"] = []
                             elif isinstance(chunk_args, str):
                                 if chunk_args:
-                                    parts: list[str] = buffer.setdefault("args_parts", [])
+                                    parts: list[str] = buffer.setdefault(
+                                        "args_parts", [])
                                     if not parts or chunk_args != parts[-1]:
                                         parts.append(chunk_args)
                                     buffer["args"] = "".join(parts)
@@ -499,7 +549,8 @@ async def execute_task(
                                         buffer_name, parsed_args, buffer_id
                                     )
                                 else:
-                                    file_op_tracker.update_args(buffer_id, parsed_args)
+                                    file_op_tracker.update_args(
+                                        buffer_id, parsed_args)
                             tool_call_buffers.pop(buffer_key, None)
                             icon = tool_icons.get(buffer_name, "🔧")
 
@@ -509,7 +560,8 @@ async def execute_task(
                             if has_responded:
                                 console.print()
 
-                            display_str = format_tool_display(buffer_name, parsed_args)
+                            display_str = format_tool_display(
+                                buffer_name, parsed_args)
                             console.print(
                                 f"  {icon} {display_str}",
                                 style=f"dim {COLORS['tool']}",
@@ -517,7 +569,8 @@ async def execute_task(
                             )
 
                             # Restart spinner with context about which tool is executing
-                            status.update(f"[bold {COLORS['thinking']}]Executing {display_str}...")
+                            status.update(
+                                f"[bold {COLORS['thinking']}]Executing {display_str}...")
                             status.start()
                             spinner_active = True
 
@@ -542,7 +595,8 @@ async def execute_task(
                                 status.stop()
                                 spinner_active = False
 
-                            description = action_request.get("description", "tool action")
+                            description = action_request.get(
+                                "description", "tool action")
                             console.print()
                             console.print(f"  [dim]⚡ {description}[/dim]")
 
@@ -578,7 +632,8 @@ async def execute_task(
                                 # Switch to auto-approve mode
                                 session_state.auto_approve = True
                                 console.print()
-                                console.print("[bold blue]✓ Auto-approve mode enabled[/bold blue]")
+                                console.print(
+                                    "[bold blue]✓ Auto-approve mode enabled[/bold blue]")
                                 console.print(
                                     "[dim]All future tool actions will be automatically approved.[/dim]"
                                 )
@@ -587,7 +642,7 @@ async def execute_task(
                                 # Approve this action and all remaining actions in the batch
                                 decisions.append({"type": "approve"})
                                 for remaining_action in hitl_request["action_requests"][
-                                    action_index + 1 :
+                                    action_index + 1:
                                 ]:
                                     decisions.append({"type": "approve"})
                                 break
@@ -599,7 +654,8 @@ async def execute_task(
                                 tool_name = action_request.get("name")
                                 if tool_name in {"write_file", "edit_file"}:
                                     file_op_tracker.mark_hitl_approved(
-                                        tool_name, action_request.get("args", {})
+                                        tool_name, action_request.get(
+                                            "args", {})
                                     )
 
                         if any(decision.get("type") == "reject" for decision in decisions):
@@ -615,8 +671,10 @@ async def execute_task(
                         status.stop()
                         spinner_active = False
 
-                    console.print("[yellow]Command rejected.[/yellow]", style="bold")
-                    console.print("Tell the agent what you'd like to do differently.")
+                    console.print(
+                        "[yellow]Command rejected.[/yellow]", style="bold")
+                    console.print(
+                        "Tell the agent what you'd like to do differently.")
                     console.print()
                     return
 
@@ -639,13 +697,15 @@ async def execute_task(
                 config=config,
                 values={
                     "messages": [
-                        HumanMessage(content="[The previous request was cancelled by the system]")
+                        HumanMessage(
+                            content="[The previous request was cancelled by the system]")
                     ]
                 },
             )
             console.print("Ready for next command.\n", style="dim")
         except Exception as e:
-            console.print(f"[red]Warning: Failed to update agent state: {e}[/red]\n")
+            console.print(
+                f"[red]Warning: Failed to update agent state: {e}[/red]\n")
 
         return
 
@@ -662,13 +722,15 @@ async def execute_task(
                 config=config,
                 values={
                     "messages": [
-                        HumanMessage(content="[User interrupted the previous request with Ctrl+C]")
+                        HumanMessage(
+                            content="[User interrupted the previous request with Ctrl+C]")
                     ]
                 },
             )
             console.print("Ready for next command.\n", style="dim")
         except Exception as e:
-            console.print(f"[red]Warning: Failed to update agent state: {e}[/red]\n")
+            console.print(
+                f"[red]Warning: Failed to update agent state: {e}[/red]\n")
 
         return
 
