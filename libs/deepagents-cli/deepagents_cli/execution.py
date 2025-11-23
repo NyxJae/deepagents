@@ -209,11 +209,10 @@ def prompt_for_tool_approval(
     # Return decision based on selection
     if selected == 0:
         return ApproveDecision(type="approve")
-    elif selected == 1:
+    if selected == 1:
         return RejectDecision(type="reject", message="User rejected the command")
-    else:
-        # Return special marker for auto-approve mode
-        return {"type": "auto_approve_all"}
+    # Return special marker for auto-approve mode
+    return {"type": "auto_approve_all"}
 
 
 async def execute_task(
@@ -223,7 +222,7 @@ async def execute_task(
     session_state,
     token_tracker: TokenTracker | None = None,
     backend=None,
-):
+) -> None:
     """Execute any task by passing it directly to the AI agent."""
     # Parse file mentions and inject content if any
     prompt_text, mentioned_files = parse_file_mentions(user_input)
@@ -324,7 +323,7 @@ async def execute_task(
                 if not isinstance(chunk, tuple) or len(chunk) != 3:
                     continue
 
-                namespace, current_stream_mode, data = chunk
+                _namespace, current_stream_mode, data = chunk
 
                 # Handle UPDATES stream - for interrupts and todos
                 if current_stream_mode == "updates":
@@ -373,7 +372,7 @@ async def execute_task(
                     if not isinstance(data, tuple) or len(data) != 2:
                         continue
 
-                    message, metadata = data
+                    message, _metadata = data
 
                     if isinstance(message, HumanMessage):
                         content = message.text
@@ -481,7 +480,9 @@ async def execute_task(
                                 # For now, skip it or handle minimally
 
                         # Handle tool call chunks
-                        elif block_type == "tool_call_chunk":
+                        # Some models (OpenAI, Anthropic) stream tool_call_chunks
+                        # Others (Gemini) don't stream them and just return the full tool_call
+                        elif block_type in ("tool_call_chunk", "tool_call"):
                             chunk_name = block.get("name")
                             chunk_args = block.get("args")
                             chunk_id = block.get("id")
@@ -641,13 +642,12 @@ async def execute_task(
 
                                 # Approve this action and all remaining actions in the batch
                                 decisions.append({"type": "approve"})
-                                for remaining_action in hitl_request["action_requests"][
+                                for _remaining_action in hitl_request["action_requests"][
                                     action_index + 1:
                                 ]:
                                     decisions.append({"type": "approve"})
                                 break
-                            else:
-                                decisions.append(decision)
+                            decisions.append(decision)
 
                             # Mark file operations as HIL-approved if user approved
                             if decision.get("type") == "approve":
